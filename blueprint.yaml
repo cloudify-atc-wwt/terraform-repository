@@ -1,0 +1,167 @@
+tosca_definitions_version: cloudify_dsl_1_3
+
+description: >
+  This blueprint creates Terraform repository from template.
+
+imports:
+  - http://cloudify.co/spec/cloudify/6.3.0/types.yaml
+  - plugin:cloudify-fabric-plugin
+  - plugin:cloudify-terraform-plugin
+  - plugin:cloudify-utilities-plugin
+
+inputs:
+  app_name:
+    type: string
+    default: "wwt-tf"
+
+  eaas_deployment_id:
+    type: string
+
+node_templates:
+  terraform:
+    type: cloudify.nodes.terraform
+    properties:
+      resource_config:
+        installation_source: https://releases.hashicorp.com/terraform/0.14.11/terraform_0.14.11_linux_amd64.zip
+
+  repo_and_secrets:
+    type: cloudify.nodes.terraform.Module
+    properties:
+      resource_config:
+        source:
+          location: "https://github.com/Cloudify-PS/wwt-tf-templates/archive/refs/heads/master.zip"
+        source_path: "repository"
+        variables:
+          app_name: { get_input: app_name }
+          cloudify_host: { get_secret: cloudify_host }
+          cloudify_password: { get_secret: cloudify_password }
+          cloudify_user: { get_secret: cloudify_user }
+          github_token: { get_secret: github_token }
+          cloudify_tenant: { get_sys: [ tenant, name ] }
+          eaas_deployment_id: { get_input: eaas_deployment_id }
+    relationships:
+      - target: terraform
+        type: cloudify.terraform.relationships.run_on_host
+
+  registration_token:
+    type: cloudify.rest.Requests
+    properties:
+      port: 443
+      ssl: true
+      verify: false
+    interfaces:
+      cloudify.interfaces.lifecycle:
+        start:
+          inputs:
+            template_file: rest/registration-token.yaml
+            params:
+              full_name: { get_attribute: [ repo_and_secrets, resources, repo, instances, 0, attributes, full_name] }
+              personal_token: { get_secret: github_token }
+              host: api.github.com
+    relationships:
+      - target: repo_and_secrets
+        type: cloudify.relationships.depends_on
+
+  runner_config:
+    type: cloudify.nodes.Root
+    interfaces:
+      cloudify.interfaces.lifecycle:
+        precreate:
+          implementation: fabric.fabric_plugin.tasks.run_commands
+          inputs:
+            commands:
+              - 'mkdir -p /tmp/cloudify-ctx/work || true'
+            fabric_env:
+              host_string: { get_secret: runner_host }
+              user: { get_secret: runner_root_user }
+              key: { get_secret: runner_key_private }
+        create:
+          implementation: fabric.fabric_plugin.tasks.run_commands
+          inputs:
+            commands:
+              - concat:
+                  - "mkdir "
+                  - { get_input: app_name }
+                  - "-runner"
+              - concat:
+                  - "curl -o "
+                  - { get_input: app_name }
+                  - "-runner/"
+                  - "actions-runner-linux-x64-2.288.1.tar.gz -L "
+                  - https://github.com/actions/runner/releases/download/
+                  - v2.288.1/actions-runner-linux-x64-2.288.1.tar.gz
+              - concat:
+                  - "tar xzf "
+                  - { get_input: app_name }
+                  - "-runner/actions-runner-linux-x64-2.288.1.tar.gz"
+                  - " --directory "
+                  - { get_input: app_name }
+                  - "-runner"
+            fabric_env:
+              host_string: { get_secret: runner_host }
+              user: { get_secret: runner_vm_user }
+              key: { get_secret: runner_key_private }
+        configure:
+          implementation: fabric.fabric_plugin.tasks.run_script
+          inputs:
+            script_path: scripts/install-dependencies.sh
+            fabric_env:
+              host_string: { get_secret: runner_host }
+              user: { get_secret: runner_root_user }
+              key: { get_secret: runner_key_private }
+            process:
+              env:
+                APP_NAME: { get_input: app_name }
+                LABUSER: { get_secret: runner_vm_user }
+        start:
+          implementation: fabric.fabric_plugin.tasks.run_commands
+          inputs:
+            commands:
+              - concat:
+                  - { get_input: app_name }
+                  - "-runner/"
+                  - config.sh --url https://github.com/
+                  - { get_attribute: [ repo_and_secrets, resources, repo, instances, 0, attributes, full_name ] }
+                  - " --unattended --token "
+                  - { get_attribute: [ registration_token, result_properties, registration-token ] }
+            fabric_env:
+              host_string: { get_secret: runner_host }
+              user: { get_secret: runner_vm_user }
+              key: { get_secret: runner_key_private }
+        poststart:
+          implementation: fabric.fabric_plugin.tasks.run_script
+          inputs:
+            script_path: scripts/configure-runner.sh
+            fabric_env:
+              host_string: { get_secret: runner_host }
+              user: { get_secret: runner_root_user }
+              key: { get_secret: runner_key_private }
+            process:
+              env:
+                APP_NAME: { get_input: app_name }
+                LABUSER: { get_secret: runner_vm_user }
+        delete:
+          implementation: fabric.fabric_plugin.tasks.run_script
+          inputs:
+            script_path: scripts/remove-runner.sh
+            fabric_env:
+              app_name: { get_input: app_name }
+              host_string: { get_secret: runner_host }
+              user: { get_secret: runner_root_user }
+              key: { get_secret: runner_key_private }
+            process:
+              env:
+                APP_NAME: { get_input: app_name }
+                LABUSER: { get_secret: runner_vm_user }
+    relationships:
+      - target: registration_token
+        type: cloudify.relationships.depends_on
+
+capabilities:
+  repo_full_name:
+    description: GitHub username and repository name
+    value: { get_attribute: [ repo_and_secrets, resources, repo, instances, 0, attributes, full_name] }
+
+  repo_url:
+    description: GitHub repository URL
+    value: { get_attribute: [ repo_and_secrets, outputs, repo_url, value ] }
